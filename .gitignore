@@ -1,0 +1,15 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python venv
+.venv/
+__pycache__/
+*.pyc
+
+# Sensitive config — contains WiFi credentials, do NOT commit
+src/Config.h
+
+# macOS
+.DS_Store
