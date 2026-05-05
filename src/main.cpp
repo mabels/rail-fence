@@ -3,7 +3,7 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
-#include <esp_now.h>
+#include <WiFiUdp.h>
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <FastAccelStepper.h>
@@ -45,9 +45,10 @@ static constexpr int8_t ENC_STEP_COUNT = 3;
 
 // ── NVS keys ─────────────────────────────────────────────────────────────────
 static constexpr char NVS_NS[]      = "slider";
-static constexpr char NVS_ROLE[]    = "role";    // uint8: 0=leader 1=follower
-static constexpr char NVS_POS[]     = "pos";     // int32: steps from reference
-static constexpr char NVS_FLW_MAC[] = "flw_mac"; // bytes[6]
+static constexpr char NVS_ROLE[]    = "role";     // uint8: 0=leader 1=follower
+static constexpr char NVS_POS[]     = "pos";      // int32: steps from reference
+static constexpr char NVS_FLW_MAC[] = "flw_mac";  // bytes[6]
+
 
 // ── Role ─────────────────────────────────────────────────────────────────────
 enum class Role : uint8_t { LEADER = 0, FOLLOWER = 1 };
@@ -76,11 +77,13 @@ static bool g_locked = true;
 enum class UIState : uint8_t { NORMAL = 0, MENU = 1 };
 static UIState g_ui_state = UIState::NORMAL;
 
-// Menu layout:  0-2 step sizes | 3 lock toggle | 4 reset | 5 exit
+// Menu layout:  0-2 step sizes | 3 lock | 4 reset | 5 IP | 6 MAC | 7 exit
 static constexpr int8_t MENU_LOCK           = 3;
 static constexpr int8_t MENU_RESET          = 4;
-static constexpr int8_t MENU_EXIT           = 5;
-static constexpr int8_t MENU_COUNT          = 6;
+static constexpr int8_t MENU_IP             = 5;
+static constexpr int8_t MENU_MAC            = 6;
+static constexpr int8_t MENU_EXIT           = 7;
+static constexpr int8_t MENU_COUNT          = 8;
 static constexpr int8_t MENU_VISIBLE        = 4;  // rows visible at once (6×10 font fits)
 static int8_t g_menu_sel    = 0;
 static int8_t g_menu_scroll = 0;  // index of topmost visible item
@@ -95,10 +98,15 @@ static volatile int32_t  g_target_pos      = 0;
 static          int32_t  g_commanded_pos   = 0;  // last value sent to moveTo()
 
 // ESP-NOW
-static uint8_t g_seq              = 0;
+static uint8_t          g_seq          = 0;
 static volatile bool    g_follower_ok  = false;
 static volatile int32_t g_follower_pos = 0;
-static uint8_t g_leader_mac[6]    = {};   // follower side: learned from first packet
+
+// UDP sync transport — two sockets: RX binds to the port, TX sends from any port.
+// Keeping them separate prevents beginPacket() from interfering with the RX buffer.
+static WiFiUDP  g_udp_rx;   // receive only — bound to UDP_PORT
+static WiFiUDP  g_udp_tx;   // send only   — unbound (ephemeral source port)
+static constexpr uint16_t UDP_PORT = 4210;
 
 // Restart scheduling (set by web config handler, checked in loop)
 static uint32_t g_restart_at = 0;
@@ -109,9 +117,31 @@ static U8G2_SH1106_128X64_NONAME_F_SW_I2C display(
     U8G2_R0, PIN_SCL, PIN_SDA, U8X8_PIN_NONE);
 static uint32_t g_last_disp_ms = 0;
 
-// Web server
-static AsyncWebServer server(80);
-static Preferences    g_prefs;
+// Web server + network log stream
+static AsyncWebServer   server(80);
+static AsyncEventSource g_events("/events");
+static Preferences      g_prefs;
+
+
+// Telnet log server — pio device monitor --port socket://<ip>:23
+static WiFiServer       g_telnet(23);
+static WiFiClient       g_telnet_clients[2];
+
+// net_log() — writes to Serial AND streams to every open /events browser tab.
+// Use exactly like Serial.printf.
+static void net_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void net_log(const char* fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    Serial.print(buf);
+    g_events.send(buf, "log", millis());
+    for (auto& c : g_telnet_clients) {
+        if (c && c.connected()) c.print(buf);
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // NVS / Storage
@@ -162,109 +192,286 @@ static void mac_format(const uint8_t* mac, char* buf, size_t len) {
 // ESP-NOW — leader side (send move, receive ack)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Arduino ESP32 v3 / ESP-IDF v5: send callback receives wifi_tx_info_t*, not mac address.
-static void espnow_on_send(const wifi_tx_info_t*, esp_now_send_status_t status) {
-    if (status != ESP_NOW_SEND_SUCCESS) g_follower_ok = false;
+// ─────────────────────────────────────────────────────────────────────────────
+// UDP sync transport
+// ─────────────────────────────────────────────────────────────────────────────
+// All packets on port 4210 share a 1-byte PktType prefix (see MoveCmd.h).
+//
+// Startup sync (Hello):
+//   Both devices broadcast HelloPkt every 500 ms for HELLO_WINDOW_MS after boot.
+//   The device with higher uptime_ms is the authoritative position source; the
+//   other adopts that position so both start aligned.
+//
+// Move reliability:
+//   Leader retransmits MoveCmd up to MOVE_RETRIES times (MOVE_ACK_TIMEOUT_MS)
+//   if no ACK arrives.  Because positions are absolute, a later packet always
+//   resyncs the follower even if earlier ones were dropped.
+//
+// Heartbeat:
+//   Leader re-sends its current position every HEARTBEAT_MS even when idle,
+//   keeping the follower in sync after any gap.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static constexpr uint32_t HELLO_WINDOW_MS    = 6000;   // ms to send hellos on boot
+static constexpr uint32_t HELLO_INTERVAL_MS  =  500;   // ms between hello broadcasts
+static constexpr uint32_t MOVE_ACK_TIMEOUT_MS=  300;   // ms to wait for ACK
+static constexpr uint8_t  MOVE_RETRIES       =    3;   // max resend attempts
+static constexpr uint32_t HEARTBEAT_MS       = 5000;   // leader idle resync interval
+
+static IPAddress g_leader_ip;           // follower learns sender IP from first packet
+static IPAddress g_follower_ip;         // leader learns follower IP from Hello/ACK
+static IPAddress g_bcast_ip;           // subnet broadcast, set after WiFi connects
+static uint8_t   g_last_seq     = 0xFF;
+
+// Pending-move retry state (leader only)
+static uint8_t   g_pend_seq     = 0xFF;
+static int32_t   g_pend_target  = 0;
+static uint32_t  g_pend_sent_ms = 0;
+static uint8_t   g_pend_tries   = 0;
+
+// Hello timing
+static uint32_t  g_hello_until_ms   = 0;
+static uint32_t  g_hello_last_ms    = 0;
+static uint32_t  g_heartbeat_last_ms= 0;
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+// Call once after WiFi connects
+static void udp_init_bcast() {
+    IPAddress local = WiFi.localIP();
+    IPAddress mask  = WiFi.subnetMask();
+    for (int i = 0; i < 4; i++)
+        g_bcast_ip[i] = (local[i] & mask[i]) | (uint8_t)(~mask[i] & 0xFF);
+    net_log("[udp] subnet broadcast: %s\n", g_bcast_ip.toString().c_str());
 }
 
-static void espnow_send_move(int32_t steps, uint32_t speed_hz) {
-    if (mac_is_zero(g_follower_mac)) return;
-    MoveCmd cmd{ steps, speed_hz, ++g_seq };
-    esp_now_send(g_follower_mac,
-        reinterpret_cast<const uint8_t*>(&cmd), sizeof(cmd));
+static void udp_broadcast(const void* data, size_t len) {
+    // Use 255.255.255.255 as fallback if subnet broadcast not yet computed
+    const IPAddress& dst = (g_bcast_ip != IPAddress(0,0,0,0)) ? g_bcast_ip : IPAddress(255,255,255,255);
+    g_udp_tx.beginPacket(dst, UDP_PORT);
+    g_udp_tx.write(reinterpret_cast<const uint8_t*>(data), len);
+    g_udp_tx.endPacket();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ESP-NOW — follower side (receive move, send ack)
-// ─────────────────────────────────────────────────────────────────────────────
+static void udp_unicast(const IPAddress& dest, const void* data, size_t len) {
+    g_udp_tx.beginPacket(dest, UDP_PORT);
+    g_udp_tx.write(reinterpret_cast<const uint8_t*>(data), len);
+    g_udp_tx.endPacket();
+}
 
-static uint8_t g_last_seq = 0xFF;
+// ── hello / startup sync ─────────────────────────────────────────────────────
 
-static void espnow_send_ack(uint8_t seq, bool success) {
-    if (mac_is_zero(g_leader_mac)) return;
+static void udp_send_hello() {
+    const int32_t pos = stepper ? stepper->getCurrentPosition() : g_target_pos;
+    HelloPkt h{};
+    h.uptime_ms = millis();
+    h.position  = pos;
+    h.role      = (g_role == Role::LEADER) ? 0 : 1;
+    udp_broadcast(&h, sizeof(h));
+}
+
+static void udp_apply_position(int32_t pos) {
+    // Adopt a position from the peer — move motor and update all state
+    if (stepper) stepper->setCurrentPosition(pos);
+    g_target_pos    = pos;
+    g_commanded_pos = pos;
+    nvs_save_position(pos);
+    net_log("[sync] adopted peer position: %ld steps (%.1f mm)\n",
+        (long)pos, pos / STEPS_PER_MM);
+}
+
+static void udp_on_hello(const HelloPkt& h, const IPAddress& src) {
+    const uint32_t my_uptime = millis();
+    net_log("[sync] hello from %s uptime=%lums pos=%ld role=%s\n",
+        src.toString().c_str(), (unsigned long)h.uptime_ms,
+        (long)h.position, h.role == 0 ? "leader" : "follower");
+
+    // Leader: record the follower's IP so we can unicast moves directly
+    if (g_role == Role::LEADER && h.role == 1) {
+        if (g_follower_ip != src) {
+            g_follower_ip = src;
+            net_log("[sync] follower IP: %s\n", g_follower_ip.toString().c_str());
+        }
+    }
+
+    if (h.uptime_ms > my_uptime) {
+        // Peer has been running longer — their position is authoritative
+        const int32_t my_pos = stepper ? stepper->getCurrentPosition() : g_target_pos;
+        if (h.position != my_pos) {
+            net_log("[sync] peer uptime %lums > ours %lums — adopting pos %ld\n",
+                (unsigned long)h.uptime_ms, (unsigned long)my_uptime, (long)h.position);
+            udp_apply_position(h.position);
+        }
+    }
+    // If we have higher uptime, keep sending our hellos — peer will adopt us
+}
+
+// ── move send / retry ────────────────────────────────────────────────────────
+
+// Send to follower: unicast when IP is known, broadcast as fallback
+static void udp_send_to_follower(const void* data, size_t len) {
+    if (g_follower_ip != IPAddress(0,0,0,0)) {
+        udp_unicast(g_follower_ip, data, len);
+    } else {
+        udp_broadcast(data, len);
+    }
+}
+
+static void udp_send_move(int32_t target_steps, uint32_t speed_hz) {
+    MoveCmd cmd{};
+    cmd.steps     = target_steps;
+    cmd.speed_hz  = speed_hz;
+    cmd.seq       = ++g_seq;
+    udp_send_to_follower(&cmd, sizeof(cmd));
+    // Arm retry tracker
+    g_pend_seq    = cmd.seq;
+    g_pend_target = target_steps;
+    g_pend_sent_ms= millis();
+    g_pend_tries  = 1;
+    // Optimistically assume follower received it — ACK will update if it arrives
+    g_follower_ok  = true;
+    g_follower_pos = target_steps;
+    net_log("[udp] send tgt=%ld seq=%u (try 1) → %s\n",
+        (long)target_steps, cmd.seq,
+        g_follower_ip != IPAddress(0,0,0,0) ? g_follower_ip.toString().c_str() : "broadcast");
+}
+
+static void udp_send_ack(const IPAddress& /*dest*/, uint8_t seq, bool success) {
     MoveAck ack{};
     ack.seq      = seq;
     ack.position = stepper ? stepper->getCurrentPosition() : 0;
     ack.success  = success;
-    esp_now_send(g_leader_mac,
-        reinterpret_cast<const uint8_t*>(&ack), sizeof(ack));
+    net_log("[udp] ack→bcast seq=%u pos=%ld bcast=%s\n",
+        seq, (long)ack.position, g_bcast_ip.toString().c_str());
+    udp_broadcast(&ack, sizeof(ack));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ESP-NOW — shared receive callback (handles both roles)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── retry + heartbeat tick (call from loop) ──────────────────────────────────
 
-static void espnow_on_recv(const esp_now_recv_info_t* info,
-                           const uint8_t* data, int len) {
-    if (g_role == Role::LEADER) {
-        // Leader receives acks from follower
-        if (len != static_cast<int>(sizeof(MoveAck))) return;
-        MoveAck ack;
-        memcpy(&ack, data, sizeof(ack));
-        g_follower_ok  = ack.success;
-        g_follower_pos = ack.position;
+static void udp_tick() {
+    const uint32_t now = millis();
 
-    } else {
-        // Follower receives move commands from leader
-        if (len != static_cast<int>(sizeof(MoveCmd))) return;
-        MoveCmd cmd;
-        memcpy(&cmd, data, sizeof(cmd));
+    // Hello window
+    if (now < g_hello_until_ms && now - g_hello_last_ms >= HELLO_INTERVAL_MS) {
+        g_hello_last_ms = now;
+        udp_send_hello();
+    }
 
-        // Learn leader MAC from first packet
-        if (mac_is_zero(g_leader_mac)) {
-            memcpy(g_leader_mac, info->src_addr, 6);
-            if (!esp_now_is_peer_exist(g_leader_mac)) {
-                esp_now_peer_info_t peer{};
-                memcpy(peer.peer_addr, g_leader_mac, 6);
-                peer.channel = 0;
-                peer.encrypt = false;
-                esp_now_add_peer(&peer);
-            }
+    if (g_role != Role::LEADER) return;
+
+    // Retry pending move if no ACK yet
+    if (g_pend_tries > 0 && g_pend_tries < MOVE_RETRIES &&
+        now - g_pend_sent_ms >= MOVE_ACK_TIMEOUT_MS) {
+        g_pend_tries++;
+        MoveCmd cmd{};
+        cmd.steps    = g_pend_target;
+        cmd.speed_hz = SPEED_MAX_HZ;
+        cmd.seq      = g_pend_seq;
+        udp_send_to_follower(&cmd, sizeof(cmd));
+        g_pend_sent_ms = now;
+        net_log("[udp] retry tgt=%ld seq=%u (try %u)\n",
+            (long)g_pend_target, g_pend_seq, g_pend_tries);
+    }
+
+    // Heartbeat — re-send current position so follower stays aligned when idle
+    if (now - g_heartbeat_last_ms >= HEARTBEAT_MS) {
+        g_heartbeat_last_ms = now;
+        {
+            const int32_t pos = stepper ? stepper->getCurrentPosition() : g_commanded_pos;
+            MoveCmd hb{};
+            hb.steps    = pos;
+            hb.speed_hz = SPEED_MAX_HZ;
+            hb.seq      = g_pend_seq;   // same seq — follower will dedup if it already has it
+            udp_send_to_follower(&hb, sizeof(hb));
+            // Keep estimated follower position in sync with ours
+            g_follower_ok  = true;
+            g_follower_pos = pos;
+            net_log("[udp] heartbeat pos=%ld\n", (long)pos);
         }
-
-        // Dedup
-        if (cmd.seq == g_last_seq) { espnow_send_ack(cmd.seq, true); return; }
-        g_last_seq = cmd.seq;
-
-        if (!stepper || stepper->isRunning()) {
-            espnow_send_ack(cmd.seq, false);
-            return;
-        }
-
-        // Add leader's relative move to our target
-        g_target_pos += cmd.steps;
-        espnow_send_ack(cmd.seq, true);
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ESP-NOW init
-// ─────────────────────────────────────────────────────────────────────────────
+// ── receive dispatch ─────────────────────────────────────────────────────────
 
-static void espnow_init() {
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("[espnow] init failed");
+static void udp_poll() {
+    int pkt = g_udp_rx.parsePacket();
+    if (pkt < 1) return;
+
+    uint8_t buf[64];
+    int len = g_udp_rx.read(buf, sizeof(buf));
+    if (len < 1) return;
+    const IPAddress src_ip = g_udp_rx.remoteIP();
+
+    net_log("[udp] rx %d bytes from %s type=0x%02x own=%s\n",
+        len, src_ip.toString().c_str(),
+        (unsigned)buf[0], WiFi.localIP().toString().c_str());
+
+    // Skip our own broadcasts
+    if (src_ip == WiFi.localIP()) return;
+
+    const PktType type = static_cast<PktType>(buf[0]);
+
+    if (type == PktType::HELLO && len == static_cast<int>(sizeof(HelloPkt))) {
+        HelloPkt h;
+        memcpy(&h, buf, sizeof(h));
+        udp_on_hello(h, src_ip);
         return;
     }
-    esp_now_register_send_cb(espnow_on_send);
-    esp_now_register_recv_cb(espnow_on_recv);
 
-    if (g_role == Role::LEADER && !mac_is_zero(g_follower_mac)) {
-        esp_now_peer_info_t peer{};
-        memcpy(peer.peer_addr, g_follower_mac, 6);
-        peer.channel = 0;
-        peer.encrypt = false;
-        if (esp_now_add_peer(&peer) == ESP_OK) {
-            char buf[18];
-            mac_format(g_follower_mac, buf, sizeof(buf));
-            Serial.printf("[espnow] follower peer: %s\n", buf);
+    if (type == PktType::MOVE_ACK && g_role == Role::LEADER) {
+        if (len != static_cast<int>(sizeof(MoveAck))) return;
+        MoveAck ack;
+        memcpy(&ack, buf, sizeof(ack));
+        if (ack.seq == g_pend_seq) {
+            g_pend_tries  = 0;   // ACKed — stop retrying
         }
-    } else if (g_role == Role::LEADER) {
-        Serial.println("[espnow] no follower MAC — standalone");
-    } else {
-        Serial.println("[espnow] follower — waiting for leader");
+        g_follower_ok  = ack.success;
+        g_follower_pos = ack.position;
+        // Learn follower IP from ACK source (most reliable discovery path)
+        if (g_follower_ip != src_ip) {
+            g_follower_ip = src_ip;
+            net_log("[udp] follower IP learned from ACK: %s\n", g_follower_ip.toString().c_str());
+        }
+        net_log("[udp] ack seq=%u ok=%d flw_pos=%ld\n",
+            ack.seq, (int)ack.success, (long)ack.position);
+        return;
+    }
+
+    if (type == PktType::MOVE_CMD && g_role == Role::FOLLOWER) {
+        if (len != static_cast<int>(sizeof(MoveCmd))) return;
+        MoveCmd cmd;
+        memcpy(&cmd, buf, sizeof(cmd));
+        g_leader_ip = src_ip;
+
+        // Dedup
+        if (cmd.seq == g_last_seq) {
+            udp_send_ack(src_ip, cmd.seq, true);
+            return;
+        }
+        g_last_seq = cmd.seq;
+
+        if (!stepper) { udp_send_ack(src_ip, cmd.seq, false); return; }
+
+        g_target_pos = cmd.steps;
+        net_log("[udp] recv tgt=%ld seq=%u → target set\n",
+            (long)cmd.steps, cmd.seq);
+        udp_send_ack(src_ip, cmd.seq, true);
+        return;
     }
 }
+
+static void udp_init() {
+    const bool rx_ok = g_udp_rx.begin(UDP_PORT);
+    g_udp_tx.begin(0);   // bind TX to ephemeral port so the socket is fully initialised
+    net_log("[udp] rx bind port %u: %s   tx ephemeral: ok\n",
+        UDP_PORT, rx_ok ? "ok" : "FAILED");
+    // Start hello window — runs for HELLO_WINDOW_MS after boot
+    g_hello_until_ms    = millis() + HELLO_WINDOW_MS;
+    g_hello_last_ms     = 0;
+    g_heartbeat_last_ms = millis();
+    net_log("[udp] hello window %lus\n", (unsigned long)(HELLO_WINDOW_MS / 1000));
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Display
@@ -303,6 +510,14 @@ static void display_update() {
                     g_locked ? "ON" : "OFF");
             } else if (i == MENU_RESET) {
                 snprintf(buf, sizeof(buf), "%sReset to 0", sel ? ">" : " ");
+            } else if (i == MENU_IP) {
+                snprintf(buf, sizeof(buf), "%sIP:%-15s",
+                    sel ? ">" : " ",
+                    WiFi.localIP().toString().c_str());
+            } else if (i == MENU_MAC) {
+                snprintf(buf, sizeof(buf), "%s%s",
+                    sel ? ">" : " ",
+                    WiFi.macAddress().c_str());
             } else {
                 snprintf(buf, sizeof(buf), "%sExit", sel ? ">" : " ");
             }
@@ -340,7 +555,7 @@ static void display_update() {
         display.drawStr(0, 40, pos_str);
 
         // Row 4: follower info or hostname
-        if (g_role == Role::LEADER && !mac_is_zero(g_follower_mac)) {
+        if (g_role == Role::LEADER) {
             char flw[32];
             snprintf(flw, sizeof(flw), "F:%s %+.1fmm",
                 g_follower_ok ? "ok" : "--",
@@ -597,6 +812,7 @@ async function loadCfg(){
     const c=await(await fetch('/api/config')).json();
     document.getElementById(c.role==='leader'?'r-L':'r-F').checked=true;
     document.getElementById('flw-mac').value=c.follower_mac||'';
+
     toggleMac(c.role==='leader');
     document.querySelectorAll('input[name=role]').forEach(r=>{
       r.addEventListener('change',()=>toggleMac(r.value==='leader'));
@@ -634,7 +850,7 @@ static void webserver_init() {
         doc["role"]             = (g_role == Role::LEADER) ? "leader" : "follower";
         doc["position"]         = stepper ? stepper->getCurrentPosition() : 0;
         doc["busy"]             = stepper ? stepper->isRunning() : false;
-        doc["follower_enabled"] = (g_role == Role::LEADER) && !mac_is_zero(g_follower_mac);
+        doc["follower_enabled"] = (g_role == Role::LEADER);
         doc["follower_ok"]      = (bool)g_follower_ok;
         doc["follower_pos"]     = (int32_t)g_follower_pos;
         doc["target_mm"]        = g_target_pos / STEPS_PER_MM;
@@ -656,6 +872,7 @@ static void webserver_init() {
         JsonDocument doc;
         doc["role"]         = (g_role == Role::LEADER) ? "leader" : "follower";
         doc["follower_mac"] = mac_str;
+
         String out; serializeJson(doc, out);
         req->send(200, "application/json", out);
     });
@@ -793,8 +1010,39 @@ static void webserver_init() {
         }
     );
 
+    // SSE log stream — open http://<ip>/log in a browser tab
+    g_events.onConnect([](AsyncEventSourceClient* c) {
+        c->send("connected", "log", millis());
+    });
+    server.addHandler(&g_events);
+
+    server.on("/log", HTTP_GET, [](AsyncWebServerRequest* req) {
+        req->send(200, "text/html",
+            "<!doctype html><html><head>"
+            "<meta charset=utf-8>"
+            "<title>Log</title>"
+            "<style>"
+            "body{background:#111;color:#0f0;font:13px/1.4 monospace;margin:0;padding:8px}"
+            "#log{white-space:pre-wrap;word-break:break-all}"
+            "</style></head><body>"
+            "<b id=host></b> &mdash; live log "
+            "(<a href=/ style=color:#08f>&#8592; back</a>)"
+            "<hr><div id=log></div>"
+            "<script>"
+            "document.getElementById('host').textContent=location.host;"
+            "const d=document.getElementById('log');"
+            "const es=new EventSource('/events');"
+            "es.addEventListener('log',e=>{"
+            "  d.textContent+=e.data;"
+            "  if(!d.textContent.endsWith('\n'))d.textContent+='\n';"
+            "  window.scrollTo(0,document.body.scrollHeight);"
+            "});"
+            "</script></body></html>"
+        );
+    });
+
     server.begin();
-    Serial.println("[web] server started on :80");
+    Serial.println("[web] server started on :80  log→ http://<ip>/log");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -804,16 +1052,36 @@ static void webserver_init() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Rotary encoder ISRs
 // ─────────────────────────────────────────────────────────────────────────────
+// Full quadrature state machine — fires on CHANGE of both CLK and DT.
+// Accumulates partial-step deltas and emits exactly ±1 per physical detent.
+// Eliminates the timing race of reading DT at CLK-fall (which caused
+// reliable CW but unreliable CCW with the old single-edge approach).
 
-static void IRAM_ATTR enc_clk_isr() {
-    // Triggered on FALLING edge of CLK.
-    // Debounce: ignore if less than 2 ms since last valid tick.
-    static uint32_t last_us = 0;
-    const uint32_t  now_us  = micros();
-    if (now_us - last_us < 2000) return;
-    last_us = now_us;
-    // DT HIGH when CLK falls → CW (+), DT LOW → CCW (-)
-    g_enc_delta += (digitalRead(PIN_ENC_DT) == HIGH) ? 1 : -1;
+static void IRAM_ATTR enc_isr() {
+    static uint8_t state = 3;   // start at rest: CLK=HIGH, DT=HIGH
+    static int8_t  acc   = 0;   // partial-step accumulator
+
+    const uint8_t s = (uint8_t)((digitalRead(PIN_ENC_CLK) << 1) | digitalRead(PIN_ENC_DT));
+
+    // Transition delta table — rows = previous 2-bit state, cols = current
+    // CW  full sequence: 3→1→0→2→3  (+4 accumulated)
+    // CCW full sequence: 3→2→0→1→3  (-4 accumulated)
+    static const int8_t T[4][4] = {
+        {  0, -1, +1,  0 },   // prev=00
+        { +1,  0,  0, -1 },   // prev=01
+        { -1,  0,  0, +1 },   // prev=10
+        {  0, +1, -1,  0 },   // prev=11 (detent)
+    };
+
+    acc  += T[state][s];
+    state = s;
+
+    // Emit exactly one tick when the encoder snaps back to the detent position
+    if (s == 3) {
+        if      (acc > 0) g_enc_delta += 1;
+        else if (acc < 0) g_enc_delta -= 1;
+        acc = 0;
+    }
 }
 
 static void IRAM_ATTR enc_sw_isr() {
@@ -880,6 +1148,9 @@ void setup() {
 
     // WiFi
     WiFi.mode(WIFI_STA);
+    // Disable WiFi power-save — without this the radio sleeps periodically and
+    // ESP-NOW packets are dropped (TX FAILED status=1 / silent receive loss).
+    WiFi.setSleep(false);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.printf("[wifi] connecting to %s", WIFI_SSID);
     while (WiFi.status() != WL_CONNECTED) { delay(250); Serial.print('.'); }
@@ -915,8 +1186,16 @@ void setup() {
     });
     ArduinoOTA.begin();
 
-    // ESP-NOW (must come after WiFi.begin — channel is now locked)
-    espnow_init();
+    // Telnet log server
+    g_telnet.begin();
+    g_telnet.setNoDelay(true);
+    net_log("[telnet] log server on port 23\n");
+    net_log("[telnet] pio device monitor --port socket://%s:23\n",
+        WiFi.localIP().toString().c_str());
+
+    // UDP sync — init broadcast address and open socket
+    udp_init_bcast();
+    udp_init();
 
     // SPREAD pin — LOW = StealthChop (quiet), HIGH = SpreadCycle (more torque)
     pinMode(PIN_SPREAD, OUTPUT);
@@ -953,8 +1232,9 @@ void setup() {
     pinMode(PIN_ENC_CLK, INPUT_PULLUP);
     pinMode(PIN_ENC_DT,  INPUT_PULLUP);
     pinMode(PIN_ENC_SW,  INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(PIN_ENC_CLK), enc_clk_isr, FALLING);
-    attachInterrupt(digitalPinToInterrupt(PIN_ENC_SW),  enc_sw_isr,  FALLING);
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_CLK), enc_isr,    CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_DT),  enc_isr,    CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_SW),  enc_sw_isr, FALLING);
     Serial.println("[enc] rotary encoder ready");
 
     // Web server
@@ -970,6 +1250,18 @@ void setup() {
 
 void loop() {
     ArduinoOTA.handle();  // always first
+    udp_poll();   // receive
+    udp_tick();   // retry + hello + heartbeat
+
+    // Accept new telnet connections
+    if (g_telnet.hasClient()) {
+        WiFiClient nc = g_telnet.accept();
+        bool placed = false;
+        for (auto& c : g_telnet_clients) {
+            if (!c || !c.connected()) { c = nc; placed = true; break; }
+        }
+        if (!placed) nc.stop();  // all slots busy
+    }
 
     // Pending restart (triggered by /api/config save)
     if (g_restart_at && millis() >= g_restart_at) {
@@ -998,10 +1290,8 @@ void loop() {
         if (g_ui_state == UIState::MENU) {
             // ── Menu mode ──────────────────────────────────────────────────
             if (delta) {
-                // Move selection, clamp at ends (no wrap — easier to hit exact item)
-                g_menu_sel = constrain(
-                    (int8_t)(g_menu_sel + (delta > 0 ? 1 : -1)),
-                    (int8_t)0, (int8_t)(MENU_COUNT - 1));
+                // Move selection — wraps: last→first and first→last
+                g_menu_sel = (int8_t)((g_menu_sel + MENU_COUNT + (delta > 0 ? 1 : -1)) % MENU_COUNT);
                 // Keep selection inside the visible window
                 if (g_menu_sel < g_menu_scroll)
                     g_menu_scroll = g_menu_sel;
@@ -1024,8 +1314,10 @@ void loop() {
                     nvs_save_position(0);
                     Serial.println("[menu] position reset to 0");
                 }
-                // Return to normal for everything except lock toggle
-                if (g_menu_sel != MENU_LOCK) {
+                // Return to normal for everything except toggle/info items
+                if (g_menu_sel != MENU_LOCK &&
+                    g_menu_sel != MENU_IP   &&
+                    g_menu_sel != MENU_MAC) {
                     g_ui_state = UIState::NORMAL;
                     Serial.println("[menu] exit");
                 }
@@ -1046,7 +1338,7 @@ void loop() {
                     const int32_t hi = (int32_t)(MAX_POS_MM * STEPS_PER_MM);
                     g_target_pos = constrain(g_target_pos, lo, hi);
                 }
-                Serial.printf("[enc] target → %+ld steps (%.1f mm)\n",
+                net_log("[enc] target → %+ld steps (%.1f mm)\n",
                     (long)g_target_pos, g_target_pos / STEPS_PER_MM);
             }
         }
@@ -1059,11 +1351,14 @@ void loop() {
         stepper->setAcceleration(ACCEL_DEFAULT);
         stepper->moveTo(g_commanded_pos);
         if (g_role == Role::LEADER) {
-            const int32_t rel = g_commanded_pos - stepper->getCurrentPosition();
-            espnow_send_move(rel, SPEED_MAX_HZ);
+            // Send absolute target so follower is always in sync,
+            // even if packets arrive while the motor is mid-move.
+            udp_send_move(g_commanded_pos, SPEED_MAX_HZ);
         }
-        Serial.printf("[move] → %+ld steps (%.1f mm)\n",
-            (long)g_commanded_pos, g_commanded_pos / STEPS_PER_MM);
+        net_log("[move] → %+ld steps (%.1f mm) stepper=%s running=%s\n",
+            (long)g_commanded_pos, g_commanded_pos / STEPS_PER_MM,
+            stepper ? "ok" : "NULL",
+            stepper ? (stepper->isRunning() ? "yes" : "no") : "n/a");
     }
 
     // Detect end-of-move → persist position to NVS
@@ -1071,7 +1366,7 @@ void loop() {
     if (g_was_running && !running) {
         const int32_t pos = stepper->getCurrentPosition();
         nvs_save_position(pos);
-        Serial.printf("[nvs] position saved: %ld (%.1f mm)\n",
+        net_log("[nvs] position saved: %ld (%.1f mm)\n",
             (long)pos, pos / STEPS_PER_MM);
     }
     g_was_running = running;
