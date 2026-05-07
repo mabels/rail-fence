@@ -1,0 +1,101 @@
+(kicad_symbol_lib
+  (version 20231120)
+  (generator "kicad_symbol_editor")
+
+  ;; ── CaliperConnector ─────────────────────────────────────────────────────
+  ;; USB-mini-style socket on the caliper body (3 active pins).
+  ;; Pin 1 = GND, Pin 3 = DATA (1.5 V), Pin 4 = CLK (1.5 V)
+  (symbol "CaliperConnector"
+    (in_bom yes)
+    (on_board yes)
+    (property "Reference" "J" (at 0 5.08 0)
+      (effects (font (size 1.27 1.27))))
+    (property "Value" "CaliperConnector" (at 0 -5.08 0)
+      (effects (font (size 1.27 1.27))))
+    (property "Footprint" "" (at 0 0 0)
+      (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Datasheet" "" (at 0 0 0)
+      (effects (font (size 1.27 1.27)) (hide yes)))
+    (symbol "CaliperConnector_0_1"
+      (rectangle (start -3.81 3.81) (end 3.81 -3.81)
+        (stroke (width 0.1) (type default))
+        (fill (type background))
+      )
+      (text "USB-mini\n(not USB)" (at 0 1.27 0)
+        (effects (font (size 0.889 0.889)) (justify center)))
+      (text "1.5 V logic" (at 0 -0.635 0)
+        (effects (font (size 0.762 0.762)) (justify center)))
+    )
+    (symbol "CaliperConnector_1_1"
+      (pin power_in line (at -6.35 2.54 0) (length 2.54)
+        (name "GND"      (effects (font (size 1.016 1.016))))
+        (number "1"      (effects (font (size 1.016 1.016)))))
+      (pin input line (at -6.35 0 0) (length 2.54)
+        (name "DATA"     (effects (font (size 1.016 1.016))))
+        (number "3"      (effects (font (size 1.016 1.016)))))
+      (pin input line (at -6.35 -2.54 0) (length 2.54)
+        (name "CLK"      (effects (font (size 1.016 1.016))))
+        (number "4"      (effects (font (size 1.016 1.016)))))
+    )
+  )
+
+  ;; ── CaliperLevelShifter ──────────────────────────────────────────────────
+  ;; Two-channel inverting NPN level-shifter (1.5 V caliper → 3.3 V ESP32).
+  ;; BOM: 2× 2N3904, 4× 10 kΩ
+  ;; Note: both CLK and DATA are INVERTED by this circuit.
+  ;; Left pins  = caliper side (1.5 V)
+  ;; Right pins = ESP32 side   (3.3 V, inverted)
+  (symbol "CaliperLevelShifter"
+    (in_bom yes)
+    (on_board yes)
+    (property "Reference" "U" (at 0 8.89 0)
+      (effects (font (size 1.27 1.27))))
+    (property "Value" "CaliperLevelShifter" (at 0 -8.89 0)
+      (effects (font (size 1.27 1.27))))
+    (property "Footprint" "" (at 0 0 0)
+      (effects (font (size 1.27 1.27)) (hide yes)))
+    (property "Datasheet" "" (at 0 0 0)
+      (effects (font (size 1.27 1.27)) (hide yes)))
+    (symbol "CaliperLevelShifter_0_1"
+      (rectangle (start -5.08 7.62) (end 5.08 -7.62)
+        (stroke (width 0.1) (type default))
+        (fill (type background))
+      )
+      ;; centre label
+      (text "NPN inverting\n1.5V → 3.3V\n2× 2N3904\n4× 10kΩ" (at 0 1.27 0)
+        (effects (font (size 0.762 0.762)) (justify center)))
+      ;; side labels
+      (text "caliper" (at -3.175 5.715 0)
+        (effects (font (size 0.762 0.762) (italic yes)) (justify left)))
+      (text "ESP32" (at 3.175 5.715 0)
+        (effects (font (size 0.762 0.762) (italic yes)) (justify right)))
+      ;; inversion bubbles — small circles on the ESP-side pin ends
+      (circle (center 5.08 -2.54) (radius 0.381)
+        (stroke (width 0.1) (type default)) (fill (type none)))
+      (circle (center 5.08 -5.08) (radius 0.381)
+        (stroke (width 0.1) (type default)) (fill (type none)))
+    )
+    (symbol "CaliperLevelShifter_1_1"
+      ;; ── Left / caliper side ──────────────────────────────────────────────
+      (pin power_in line (at -7.62 5.08 0) (length 2.54)
+        (name "GND"       (effects (font (size 1.016 1.016))))
+        (number "1"       (effects (font (size 1.016 1.016)))))
+      (pin input line (at -7.62 -2.54 0) (length 2.54)
+        (name "DATA_CAL"  (effects (font (size 1.016 1.016))))
+        (number "2"       (effects (font (size 1.016 1.016)))))
+      (pin input line (at -7.62 -5.08 0) (length 2.54)
+        (name "CLK_CAL"   (effects (font (size 1.016 1.016))))
+        (number "3"       (effects (font (size 1.016 1.016)))))
+      ;; ── Right / ESP32 side ───────────────────────────────────────────────
+      (pin power_in line (at 7.62 5.08 180) (length 2.54)
+        (name "3V3"       (effects (font (size 1.016 1.016))))
+        (number "4"       (effects (font (size 1.016 1.016)))))
+      (pin output inverted (at 7.62 -2.54 180) (length 2.54)
+        (name "~{DATA_ESP}" (effects (font (size 1.016 1.016))))
+        (number "5"         (effects (font (size 1.016 1.016)))))
+      (pin output inverted (at 7.62 -5.08 180) (length 2.54)
+        (name "~{CLK_ESP}"  (effects (font (size 1.016 1.016))))
+        (number "6"         (effects (font (size 1.016 1.016)))))
+    )
+  )
+)
