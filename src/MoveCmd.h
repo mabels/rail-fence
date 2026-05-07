@@ -1,35 +1,49 @@
 #pragma once
 #include <stdint.h>
 
-// UDP sync wire protocol — all packets share a 1-byte type prefix.
+// UDP sync wire protocol — all packets share a 1-byte PktType prefix.
+// All packets are broadcast; every device ignores its own source IP.
 
 enum class PktType : uint8_t {
-    MOVE_CMD = 0x01,   // leader → follower: move to absolute position
-    MOVE_ACK = 0x02,   // follower → leader: acknowledge
-    HELLO    = 0x03,   // broadcast on startup: position + uptime for sync election
+    HELLO         = 0x01,   // startup: position + uptime for election
+    SYNC_MOVE     = 0x10,   // initiator → peer: start moving to target
+    SYNC_PROGRESS = 0x11,   // both → broadcast: position update during move
+    SYNC_ARRIVED  = 0x12,   // both → broadcast: motor stopped at target
+    SYNC_FAIL     = 0x13,   // either → broadcast: conflict / abort
 };
 
-// Leader → follower: move motor to absolute step position
-struct MoveCmd {
-    PktType  type     = PktType::MOVE_CMD;
-    int32_t  steps;      // absolute target in steps
-    uint32_t speed_hz;   // steps/s
-    uint8_t  seq;        // rolling sequence (dedup)
-};
-
-// Follower → leader: acknowledgement
-struct MoveAck {
-    PktType  type     = PktType::MOVE_ACK;
-    uint8_t  seq;        // echoes MoveCmd.seq
-    int32_t  position;   // follower current position in steps
-    bool     success;
-};
-
-// Broadcast on boot and periodically: for startup position election.
-// The device with the higher uptime_ms is the authoritative position source.
+// Broadcast on boot — device with higher uptime wins position authority
 struct HelloPkt {
-    PktType  type     = PktType::HELLO;
-    uint32_t uptime_ms;
-    int32_t  position;   // current position in steps
-    uint8_t  role;       // 0 = leader, 1 = follower
+    PktType  type      = PktType::HELLO;
+    uint32_t uptime_ms = 0;
+    int32_t  position  = 0;
+};
+
+// Initiator → broadcast: "move to target, txid identifies this transaction"
+struct SyncMove {
+    PktType  type     = PktType::SYNC_MOVE;
+    uint16_t txid     = 0;    // random transaction id
+    int32_t  target   = 0;    // absolute steps
+    uint32_t speed_hz = 0;
+};
+
+// Both → broadcast: periodic current position while moving
+struct SyncProgress {
+    PktType  type = PktType::SYNC_PROGRESS;
+    uint16_t txid = 0;
+    int32_t  pos  = 0;
+};
+
+// Both → broadcast: motor reached final position
+struct SyncArrived {
+    PktType  type = PktType::SYNC_ARRIVED;
+    uint16_t txid = 0;
+    int32_t  pos  = 0;
+};
+
+// Either → broadcast: conflict (two txids seen) or other abort
+struct SyncFail {
+    PktType  type   = PktType::SYNC_FAIL;
+    uint16_t txid   = 0;
+    uint8_t  reason = 0;   // 1 = conflict, 2 = timeout
 };
